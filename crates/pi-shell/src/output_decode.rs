@@ -5,15 +5,20 @@
 //! (GBK) on Simplified Chinese — and treating those bytes as UTF-8 replaces
 //! them with U+FFFD (乱码).
 //!
-//! Policy: decode as UTF-8 until a complete invalid sequence; on Windows,
-//! switch the remainder of that stream to the process ANSI code page
-//! (`GetACP`) unless that page is already UTF-8.
+//! Policy: decode as UTF-8. On Windows, at an invalid sequence the bytes up
+//! to the next standalone ASCII byte (walked DBCS-aware) are strict-decoded
+//! with the process ANSI code page (`GetACP`, unless it is already UTF-8).
+//! Only if that is real ANSI text (on a DBCS page: it holds a lead byte with
+//! a non-ASCII trail) does the stream switch to the ANSI code page. Otherwise
+//! the invalid sequence is a stray byte: it becomes U+FFFD and the stream
+//! stays UTF-8, so `printf '\xeb\n'` does not corrupt the valid UTF-8 after
+//! it (CP949 `EB` would swallow the newline).
 //!
 //! Valid UTF-8 always wins, including bytes that are also valid ACP (GBK 一 is
 //! `D2 BB`, which is U+04BB in UTF-8). Overlap is ambiguous; this prefers the
-//! modern-tool default over guessing language. The ACP switch is permanent
-//! for the stream: command output is one encoding, not mixed. A single
-//! invalid byte therefore ACP-decodes everything after it.
+//! modern-tool default over guessing language. Once confirmed the ACP switch
+//! is permanent for the stream: command output is one encoding, not mixed.
+//! A stray byte pair that happens to be valid ACP still switches the stream.
 
 use std::str;
 
@@ -22,6 +27,9 @@ const REPLACEMENT: &str = "\u{FFFD}";
 /// replacement characters rather than being re-decoded as itself.
 #[cfg(windows)]
 const CP_UTF8: u32 = 65001;
+/// Longest span held back while deciding whether invalid bytes are ACP text.
+#[cfg(windows)]
+const ACP_SPAN_CAP: usize = 4096;
 
 enum Mode {
 	Utf8,
@@ -35,6 +43,12 @@ pub struct OutputDecoder {
 	mode:              Mode,
 	#[cfg(windows)]
 	fallback_codepage: u32,
+	/// The fallback page has DBCS lead bytes.
+	#[cfg(windows)]
+	dbcs_page:         bool,
+	/// `pending[..rejected_end]` was judged not to be ANSI text.
+	#[cfg(windows)]
+	rejected_end:      usize,
 }
 
 impl Default for OutputDecoder {
@@ -60,11 +74,13 @@ impl OutputDecoder {
 	/// Decode with an explicit ANSI fallback. Used by tests so GBK fixtures
 	/// run on any Windows host, not only a Chinese ACP.
 	#[cfg(windows)]
-	pub const fn with_fallback_codepage(codepage: u32) -> Self {
+	pub fn with_fallback_codepage(codepage: u32) -> Self {
 		Self {
 			pending:           Vec::new(),
 			mode:              Mode::Utf8,
 			fallback_codepage: codepage,
+			dbcs_page:         (0x80..=0xff).any(|b| is_dbcs_lead(codepage, b)),
+			rejected_end:      0,
 		}
 	}
 
@@ -119,14 +135,22 @@ impl OutputDecoder {
 			start = valid_end;
 			if let Some(invalid_len) = err.error_len() {
 				#[cfg(windows)]
-				if self.can_fallback_to_acp() {
-					// One encoding per command. Do not resume UTF-8 after
-					// a bad byte: later UTF-8 would be ACP-mojibake, but
-					// cmd/chcp emit ACP for the whole stream.
-					self.pending.drain(..start);
-					self.mode = Mode::Acp;
-					out.push_str(&self.drain_acp(eof));
-					return out;
+				if self.can_fallback_to_acp() && start >= self.rejected_end {
+					match self.confirm_acp(start, eof) {
+						// A span that is real ANSI text: one encoding per
+						// command, so the rest of the stream is ACP too.
+						Some((true, _)) => {
+							self.pending.drain(..start);
+							self.mode = Mode::Acp;
+							out.push_str(&self.drain_acp(eof));
+							return out;
+						},
+						// Not ACP text: stray bytes. Every invalid sequence up
+						// to the span end is one too; do not re-walk it.
+						Some((false, end)) => self.rejected_end = end,
+						// The span is not terminated yet: wait for more.
+						None => break,
+					}
 				}
 
 				out.push_str(REPLACEMENT);
@@ -137,7 +161,11 @@ impl OutputDecoder {
 			// read, or resolve it at EOF.
 			if eof {
 				#[cfg(windows)]
-				if self.can_fallback_to_acp() {
+				if self.can_fallback_to_acp()
+					&& self
+						.confirm_acp(start, true)
+						.is_some_and(|(confirmed, _)| confirmed)
+				{
 					self.pending.drain(..start);
 					self.mode = Mode::Acp;
 					out.push_str(&self.drain_acp(true));
@@ -149,6 +177,10 @@ impl OutputDecoder {
 			}
 			break;
 		}
+		#[cfg(windows)]
+		{
+			self.rejected_end = self.rejected_end.saturating_sub(start);
+		}
 		self.pending.drain(..start);
 		out
 	}
@@ -156,6 +188,62 @@ impl OutputDecoder {
 	#[cfg(windows)]
 	const fn can_fallback_to_acp(&self) -> bool {
 		self.fallback_codepage != 0 && self.fallback_codepage != CP_UTF8
+	}
+
+	/// Decides whether the invalid UTF-8 at `start` is ANSI text, so the
+	/// stream should switch to the ACP, rather than a stray byte.
+	///
+	/// Takes the bytes from `start` to the next standalone ASCII byte with a
+	/// DBCS-aware walk (a lead byte consumes its trail even when that is ASCII)
+	/// and strict-decodes them. On a DBCS page the span must also hold a lead
+	/// byte with a non-ASCII trail, or at least two lead+trail pairs
+	/// (Shift-JIS/Big5 text often has ASCII trails only); a single pair such
+	/// as `EB 41` does not confirm. Returns the verdict and the span end, or
+	/// `None` while the span is not terminated yet.
+	#[cfg(windows)]
+	fn confirm_acp(&self, start: usize, eof: bool) -> Option<(bool, usize)> {
+		let cp = self.fallback_codepage;
+		let buf = &self.pending;
+		let mut index = start;
+		let mut pairs = 0usize;
+		let mut wide_pair = false;
+		let end = loop {
+			let capped = index - start >= ACP_SPAN_CAP;
+			let Some(&byte) = buf.get(index) else {
+				if eof || capped {
+					break index;
+				}
+				return None;
+			};
+			if byte.is_ascii() {
+				break index;
+			}
+			if is_dbcs_lead(cp, byte) {
+				let Some(&trail) = buf.get(index + 1) else {
+					if eof {
+						// Dangling lead byte: strict decode rejects it.
+						break index + 1;
+					}
+					if capped {
+						// Leave it out: its trail may arrive next.
+						break index;
+					}
+					return None;
+				};
+				pairs += 1;
+				wide_pair |= !trail.is_ascii();
+				index += 2;
+			} else {
+				index += 1;
+			}
+		};
+		let strict = decode_codepage(
+			cp,
+			&buf[start..end],
+			windows_sys::Win32::Globalization::MB_ERR_INVALID_CHARS,
+		);
+		let confirmed = strict.is_some() && (wide_pair || pairs >= 2 || !self.dbcs_page);
+		Some((confirmed, end))
 	}
 
 	#[cfg(windows)]
@@ -167,7 +255,7 @@ impl OutputDecoder {
 		if len == 0 {
 			return String::new();
 		}
-		let decoded = decode_codepage(self.fallback_codepage, &self.pending[..len])
+		let decoded = decode_codepage(self.fallback_codepage, &self.pending[..len], 0)
 			.unwrap_or_else(|| String::from_utf8_lossy(&self.pending[..len]).into_owned());
 		self.pending.drain(..len);
 		decoded
@@ -210,7 +298,7 @@ fn complete_acp_len(codepage: u32, bytes: &[u8], eof: bool) -> usize {
 }
 
 #[cfg(windows)]
-fn decode_codepage(codepage: u32, bytes: &[u8]) -> Option<String> {
+fn decode_codepage(codepage: u32, bytes: &[u8], flags: u32) -> Option<String> {
 	if bytes.is_empty() {
 		return Some(String::new());
 	}
@@ -220,7 +308,7 @@ fn decode_codepage(codepage: u32, bytes: &[u8]) -> Option<String> {
 	let needed = unsafe {
 		windows_sys::Win32::Globalization::MultiByteToWideChar(
 			codepage,
-			0,
+			flags,
 			bytes.as_ptr(),
 			len,
 			std::ptr::null_mut(),
@@ -235,7 +323,7 @@ fn decode_codepage(codepage: u32, bytes: &[u8]) -> Option<String> {
 	let written = unsafe {
 		windows_sys::Win32::Globalization::MultiByteToWideChar(
 			codepage,
-			0,
+			flags,
 			bytes.as_ptr(),
 			len,
 			wide.as_mut_ptr(),
@@ -279,9 +367,7 @@ mod tests {
 	#[test]
 	fn gbk_decodes_to_chinese() {
 		// GBK for 中文.
-		let mut decoder = OutputDecoder::with_fallback_codepage(936);
-		assert_eq!(decoder.push(&[0xd6, 0xd0, 0xce, 0xc4]), "中文");
-		assert_eq!(decoder.finish(), "");
+		assert_split_invariant(936, &[0xd6, 0xd0, 0xce, 0xc4], "中文");
 	}
 
 	#[cfg(windows)]
@@ -291,8 +377,9 @@ mod tests {
 			return;
 		}
 		let mut decoder = OutputDecoder::new();
-		assert_eq!(decoder.push(&[0xd6, 0xd0, 0xce, 0xc4]), "中文");
-		assert_eq!(decoder.finish(), "");
+		let mut out = decoder.push(&[0xd6, 0xd0, 0xce, 0xc4]);
+		out.push_str(&decoder.finish());
+		assert_eq!(out, "中文");
 	}
 
 	#[cfg(windows)]
@@ -307,20 +394,15 @@ mod tests {
 	#[cfg(windows)]
 	#[test]
 	fn gbk_holds_real_lead_not_trail_that_looks_like_lead() {
-		let mut decoder = OutputDecoder::with_fallback_codepage(936);
 		// 文 is CE C4; C4 is also a GBK lead value, so a last-byte heuristic
 		// would hold it back and mangle 文.
-		assert_eq!(decoder.push(&[0xce, 0xc4]), "文");
-		assert_eq!(decoder.finish(), "");
+		assert_split_invariant(936, &[0xce, 0xc4], "文");
 	}
 
 	#[cfg(windows)]
 	#[test]
 	fn ascii_prefix_then_gbk() {
-		let mut decoder = OutputDecoder::with_fallback_codepage(936);
-		assert_eq!(decoder.push(b"cmd"), "cmd");
-		assert_eq!(decoder.push(&[0xd6, 0xd0, 0xce, 0xc4]), "中文");
-		assert_eq!(decoder.finish(), "");
+		assert_split_invariant(936, b"cmd\xd6\xd0\xce\xc4", "cmd中文");
 	}
 
 	#[cfg(windows)]
@@ -347,6 +429,149 @@ mod tests {
 		let mut decoder = OutputDecoder::with_fallback_codepage(65001);
 		assert_eq!(decoder.push(&[0xff]), "\u{FFFD}");
 		assert_eq!(decoder.finish(), "");
+	}
+
+	/// A lone invalid byte that is a DBCS lead (CP949 `EB`) must not swallow
+	/// the newline nor turn the valid UTF-8 after it into mojibake.
+	#[cfg(windows)]
+	#[test]
+	fn stray_lead_byte_keeps_following_utf8() {
+		for cp in [949, 936] {
+			assert_split_invariant(
+				cp,
+				b"ok\n\xeb\n\xed\x95\x9c\xea\xb8\x80\n",
+				"ok\n\u{FFFD}\n한글\n",
+			);
+			assert_split_invariant(
+				cp,
+				b"\xea\xb0\x80\xeb\n\xed\x95\x9c\xea\n",
+				"가\u{FFFD}\n한\u{FFFD}\n",
+			);
+		}
+	}
+
+	/// `EB 41` is a valid CP949 pair, but with an ASCII trail it does not
+	/// prove the stream is ANSI text.
+	#[cfg(windows)]
+	#[test]
+	fn ascii_trail_pair_does_not_confirm_acp() {
+		assert_split_invariant(949, b"\xebA\n\xed\x95\x9c\n", "\u{FFFD}A\n한\n");
+	}
+
+	/// Legacy ANSI output: after the span is confirmed the stream is ACP, as
+	/// before, whatever the following lines look like.
+	#[cfg(windows)]
+	#[test]
+	fn legacy_acp_lines_decode_whole() {
+		let cases: [(u32, &str); 12] = [
+			(936, "中国\r\n"),
+			(936, "中文一\n"),
+			(936, "中国丂\r\n"),
+			(936, " 驱动器 C 中的卷没有标签。\r\n"),
+			(936, "中文\r\n系统找不到指定的文件。\r\n"),
+			(949, "한글 중국 볼륨에는 이름이 없습니다\r\n"),
+			(949, "지정된 파일을 찾을 수 없습니다.\r\n"),
+			(932, "指定されたファイルが見つかりません。\r\n"),
+			(932, "日本\r\n指定されたファイルが見つかりません。\r\n"),
+			(932, "ソース サービス\r\n"),
+			(932, "サービス コマンド\r\n"),
+			(950, "許功 程式\r\n"),
+		];
+		for (cp, text) in cases {
+			assert_split_invariant(cp, &encode_codepage(cp, text), text);
+		}
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn cp949_hangul_bytes_decode_whole() {
+		assert_split_invariant(949, b"\xc7\xd1\xb1\xdb", "한글");
+		// `EB ED` and `95 9C` are both valid CP949 pairs.
+		assert_split_invariant(949, b"\xeb\xed\x95\x9c\n", "鷹븳\n");
+	}
+
+	/// A span longer than the cap is decided in pieces; a read ending on a
+	/// lead byte at the cap must not drop the stream into misaligned decoding.
+	#[cfg(windows)]
+	#[test]
+	fn split_at_span_cap_keeps_dbcs_alignment() {
+		let text = format!("{}\n", "中".repeat(2100));
+		let bytes = encode_codepage(936, &text);
+		for split in ACP_SPAN_CAP - 2..=ACP_SPAN_CAP + 3 {
+			let mut decoder = OutputDecoder::with_fallback_codepage(936);
+			let mut out = decoder.push(&bytes[..split]);
+			out.push_str(&decoder.push(&bytes[split..]));
+			out.push_str(&decoder.finish());
+			assert_eq!(out, text, "split at {split}");
+		}
+	}
+
+	/// Many rejected sequences must cost linear time, not a re-scan of the
+	/// rest of the span each.
+	#[cfg(windows)]
+	#[test]
+	fn many_stray_bytes_decode_in_linear_time() {
+		for (cp, byte) in [(949, 0xff), (936, 0x80)] {
+			let bytes = vec![byte; 256 * 1024];
+			let started = std::time::Instant::now();
+			let mut decoder = OutputDecoder::with_fallback_codepage(cp);
+			let mut out = decoder.push(&bytes);
+			out.push_str(&decoder.finish());
+			assert_eq!(out, "\u{FFFD}".repeat(bytes.len()), "cp{cp}");
+			assert!(started.elapsed().as_secs() < 5, "cp{cp} took {:?}", started.elapsed());
+		}
+	}
+
+	/// Single-push output must equal `expected`, and every one- and two-way
+	/// split of the input must produce the same text.
+	#[cfg(windows)]
+	fn assert_split_invariant(codepage: u32, bytes: &[u8], expected: &str) {
+		let run = |chunks: &[&[u8]]| {
+			let mut decoder = OutputDecoder::with_fallback_codepage(codepage);
+			let mut out = String::new();
+			for chunk in chunks {
+				out.push_str(&decoder.push(chunk));
+			}
+			out.push_str(&decoder.finish());
+			out
+		};
+		assert_eq!(run(&[bytes]), expected, "cp{codepage} single push of {bytes:02x?}");
+		for a in 0..=bytes.len() {
+			assert_eq!(
+				run(&[&bytes[..a], &bytes[a..]]),
+				expected,
+				"cp{codepage} split at {a} of {bytes:02x?}"
+			);
+			for b in a..=bytes.len() {
+				assert_eq!(
+					run(&[&bytes[..a], &bytes[a..b], &bytes[b..]]),
+					expected,
+					"cp{codepage} splits at {a},{b} of {bytes:02x?}"
+				);
+			}
+		}
+	}
+
+	#[cfg(windows)]
+	fn encode_codepage(codepage: u32, text: &str) -> Vec<u8> {
+		let wide: Vec<u16> = text.encode_utf16().collect();
+		let mut buf = vec![0u8; wide.len() * 4];
+		// SAFETY: `wide` and `buf` are valid for the lengths passed.
+		let written = unsafe {
+			windows_sys::Win32::Globalization::WideCharToMultiByte(
+				codepage,
+				0,
+				wide.as_ptr(),
+				wide.len() as i32,
+				buf.as_mut_ptr(),
+				buf.len() as i32,
+				std::ptr::null(),
+				std::ptr::null_mut(),
+			)
+		};
+		assert!(written > 0, "encode failed");
+		buf.truncate(written as usize);
+		buf
 	}
 
 	#[cfg(not(windows))]
