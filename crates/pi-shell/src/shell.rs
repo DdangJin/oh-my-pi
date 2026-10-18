@@ -2628,6 +2628,24 @@ mod tests {
 		assert_eq!(output, "가\u{FFFD}\n한\u{FFFD}\n");
 	}
 
+	/// A two-byte remnant of a cut Hangul (`EA B0`) is a valid ANSI character
+	/// on CP949, but a cut UTF-8 prefix is not code-page evidence.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn byte_cut_remnant_does_not_switch_stream() {
+		#[cfg(windows)]
+		{
+			// SAFETY: GetACP has no preconditions.
+			if unsafe { windows_sys::Win32::Globalization::GetACP() } != 949 {
+				return;
+			}
+		}
+		let (result, output) =
+			execute_captured("printf '가나다라\\n' | cut -c1-2; printf '다음 줄\\n'".to_string())
+				.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		assert_eq!(output, "\u{FFFD}\n다음 줄\n");
+	}
+
 	/// Shell initialization must recover when a long-running host's inherited
 	/// working directory is deleted. This runs in a child process because cwd is
 	/// process-global.
